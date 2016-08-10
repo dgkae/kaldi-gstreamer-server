@@ -27,6 +27,7 @@ import tornado.concurrent
 import settings
 import common
 import wave
+import audioop
 
 
 class Application(tornado.web.Application):
@@ -289,16 +290,77 @@ class DecoderSocketHandler(tornado.websocket.WebSocketHandler):
         self.write_message(json.dumps(event))
     '''
 
+    def nextWav(self):
+        self.segid = self.segid + 1
+        self.silence_unit_cnt = 0
+        self.segout = True
+        self.wavfn = self.id + '-' + str(self.segid) + '.wav'
+        if self.wav != None:
+            self.wav.close()
+        self.wav = wave.open(self.wavfn, 'wb')
+        self.wav.setparams((1,2,16000,0,'NONE','not compressed'))
+        logging.info("new segment=%s", self.wavfn)
+
+
+
     def open(self):
         self.id = str(uuid.uuid4())
         logging.info("%s: OPEN" % (self.id))
         logging.info("%s: Request arguments: %s" % (self.id, " ".join(["%s=\"%s\"" % (a, self.get_argument(a)) for a in self.request.arguments])))
-        self.wav = wave.open(self.id + '.wav', 'wb')
-        self.wav.setparams((1,2,16000,0,'NONE','not compressed'))
+        self.wav = None
+        self.segid = 0 #segment id
+        self.nextWav()
+        self.segout = True # flag out of a segment
+        self.silencet= 0.0
+        self.SILENCE_UNIT_LEN = 1600 #int(16000*0.1)
+        self.silence_unit_cnt = 0
+        self.SICLENCE_THRESH = 300.0
+        self.SILENCE_UNIT_MAX = 5
+        self.pre_silences = []
+        self.remain_message = ''
+
+    def pushData(self, unit_data):
+        rms = audioop.rms(unit_data, 2)
+        logging.info("rms=%f" % rms)
+
+        if rms < self.SICLENCE_THRESH:
+            if self.segout == False:
+                self.wav.writeframes(unit_data)
+                self.silence_unit_cnt = self.silence_unit_cnt + 1
+                if self.silence_unit_cnt >= self.SILENCE_UNIT_MAX:
+                        #when in a segment, and enough of silence, 
+                        #make a new segment
+                        self.segout = True
+                        oldfn = self.wavfn; # recognize with it
+                        self.nextWav()
+
+        else:
+            if self.segout == True:
+                #goes in
+                self.segout = False
+
+                #push pre silences in
+                for d in self.pre_silences:
+                    self.wav.writeframes(d)
+
+            self.wav.writeframes(unit_data)
+
+
+                
+
+        
+        self.pre_silences.append(unit_data)
+        if len(self.pre_silences) >= self.SILENCE_UNIT_MAX:
+            self.pre_silences.pop()
+
+        
+
   
 
     def on_connection_close(self):
         logging.info("%s: Handling on_connection_close()" % self.id)
+        if self.wav != None:
+            self.wav.close()
 
     def on_message(self, message):
 
@@ -308,7 +370,13 @@ class DecoderSocketHandler(tornado.websocket.WebSocketHandler):
             pass
         else:
             # self.worker.write_message(message, binary=True)
-            self.wav.writeframes(message)
+            # self.wav.writeframes(message)
+            # logging.info("rms=%f" % audioop.rms(message, 2))
+            self.remain_message = self.remain_message + message
+            while len(self.remain_message) >= self.SILENCE_UNIT_LEN:
+                unit_data = self.remain_message[:self.SILENCE_UNIT_LEN]
+                self.remain_message = self.remain_message[self.SILENCE_UNIT_LEN:]
+                self.pushData(unit_data)
 
 
 
